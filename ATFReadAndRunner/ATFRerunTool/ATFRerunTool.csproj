@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>ATFRerunTool</AssemblyName>
+    <RootNamespace>ATFRerunTool</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <AllowedReferenceRelatedFileExtensions>none</AllowedReferenceRelatedFileExtensions>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Shared tool files that must land next to the executable after publish -->
+    <Content Include="appsettings.json" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\ATFRun\KnownToBeBroken.txt" CopyToPublishDirectory="PreserveNewest">
+      <TargetPath>ATFRun\KnownToBeBroken.txt</TargetPath>
+    </Content>
+  </ItemGroup>
+</Project>

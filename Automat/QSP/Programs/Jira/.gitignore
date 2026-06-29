@@ -1,0 +1,7 @@
+# Browser session — contains personal login cookies, never commit
+session/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

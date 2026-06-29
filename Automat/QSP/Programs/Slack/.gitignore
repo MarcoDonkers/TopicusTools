@@ -1,0 +1,9 @@
+# Slack session and credentials — never commit these
+session/
+config.json
+channel_cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

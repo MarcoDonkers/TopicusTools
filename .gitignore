@@ -1,0 +1,38 @@
+# .NET build output
+bin/
+obj/
+publish/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.rsuser
+
+# Rider
+.idea/
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+project.lock.json
+
+# Node / JavaScript
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Build artifacts
+*.exe
+*.dll
+*.pdb
