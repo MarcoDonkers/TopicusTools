@@ -235,6 +235,9 @@ internal static class Program
 
         Console.WriteLine($"\nResults folder: {settings.ResultsOutputDirectory}");
 
+        // Ask for environment and apply config
+        ApplyEnvironmentConfig();
+
         // Ask about retries (default: No — run once without extra rounds)
         settings.MaxRerunCount = AskRetries(settings.MaxRerunCount);
 
@@ -350,6 +353,94 @@ internal static class Program
         Console.WriteLine("Re-generating report from existing XML results is not yet implemented.");
         Console.WriteLine("Run 'ATFRerunTool rerun <log-file>' to generate a new report.");
         return 0;
+    }
+
+    // ─── Environment config ───────────────────────────────────────────────────
+
+    private static readonly (string Number, string Host)[] _environments =
+    [
+        ("1",  "o1.qsp.finance.lab"),
+        ("2",  "o2.qsp.finance.lab"),
+        ("3",  "o3.qsp.finance.lab"),
+        ("6",  "o6.qsp.finance.lab"),
+        ("8",  "o8.qsp.finance.lab"),
+        ("9",  "o9.qsp.finance.lab"),
+        ("10", "o10.qsp.finance.lab"),
+        ("11", "o11.qsp.finance.lab"),
+        ("12", "o12.qsp.finance.lab"),
+        ("13", "o13.qsp.finance.lab"),
+        ("14", "o14.qsp.finance.lab"),
+        ("15", "o15.qsp.finance.lab"),
+        ("16", "o16.qsp.finance.lab"),
+        ("18", "o18.qsp.finance.lab"),
+        ("19", "o19.qsp.finance.lab"),
+        ("20", "o20.qsp.finance.lab"),
+        ("21", "o21.qsp.finance.lab"),
+        ("22", "o22.qsp.finance.lab"),
+        ("23", "o23.qsp.finance.lab"),
+        ("24", "o24.qsp.finance.lab"),
+    ];
+
+    private static void ApplyEnvironmentConfig()
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("Select environment:");
+        Console.ResetColor();
+
+        foreach (var (num, host) in _environments)
+            Console.WriteLine($"  {num,3}) {host}");
+
+        string? envHost = null;
+        while (envHost is null)
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.Write("\nMake a choice: ");
+            Console.ResetColor();
+
+            var input = Console.ReadLine()?.Trim();
+            envHost = _environments.FirstOrDefault(e => e.Number == input).Host;
+
+            if (envHost is null)
+                Console.WriteLine($"  \"{input}\" is not a valid option.");
+        }
+
+        Console.WriteLine($"  → Configuring for {envHost}...");
+
+        var configBat = @"C:\WorkEnvironment\QSP.Core\QSP.ATF.Config (keuzemenu).bat";
+        var configDir = Path.GetDirectoryName(configBat)!;
+        var psScript = Path.Combine(configDir, @"Tools\Powershell\TransformConfig.ps1");
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-ExecutionPolicy Bypass -File \"{psScript}\" -environment \"{envHost}\"",
+            WorkingDirectory = configDir,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
+        using var process = new Process { StartInfo = psi };
+        process.OutputDataReceived += (_, e) => { if (e.Data != null) Console.WriteLine("  " + e.Data); };
+        process.ErrorDataReceived += (_, e) => { if (e.Data != null) Console.WriteLine("  ERR: " + e.Data); };
+        process.Start();
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        process.WaitForExit();
+
+        if (process.ExitCode != 0)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"  Warning: config script exited with code {process.ExitCode}");
+            Console.ResetColor();
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"  Config applied.");
+            Console.ResetColor();
+        }
     }
 
     // ─── File Picker ──────────────────────────────────────────────────────────
