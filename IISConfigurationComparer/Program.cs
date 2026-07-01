@@ -1,3 +1,4 @@
+using System.Xml.Linq;
 using IISConfigurationComparer.Models;
 using IISConfigurationComparer.Services;
 using Microsoft.Extensions.Configuration;
@@ -20,18 +21,20 @@ if (environments.Count == 0)
 
 // ─── Parse CLI arguments ─────────────────────────────────────────────────────
 // Usage:
-//   IISConfigurationComparer                          → compare all pairs (console)
-//   IISConfigurationComparer <env1> <env2>            → compare specific pair
-//   IISConfigurationComparer --html [env1] [env2]     → generate HTML report
-//   IISConfigurationComparer --list                   → list configured environments
-//   IISConfigurationComparer --save <env> <file.xml>  → save config to file
-//   IISConfigurationComparer --local <file.xml> <env> → compare local file vs env
+//   IISConfigurationComparer                              → compare all pairs (console)
+//   IISConfigurationComparer <env1> <env2>                → compare specific pair
+//   IISConfigurationComparer --html [env1] [env2]         → generate HTML report
+//   IISConfigurationComparer --webapp [--html] [env1] [env2] → include app config comparison
+//   IISConfigurationComparer --list                       → list configured environments
+//   IISConfigurationComparer --save <env> <file.xml>      → save config to file
+//   IISConfigurationComparer --local <file.xml> <env>     → compare local file vs env
+//   IISConfigurationComparer --explore-webapp <env>       → list app configs found on env
 
 var cliArgs = Environment.GetCommandLineArgs().Skip(1).ToArray();
 
-// Strip --html flag and note it for later
-bool htmlOutput = cliArgs.Contains("--html");
-cliArgs = cliArgs.Where(a => a != "--html").ToArray();
+bool htmlOutput  = cliArgs.Contains("--html");
+bool webAppMode  = cliArgs.Contains("--webapp");
+cliArgs = cliArgs.Where(a => a != "--html" && a != "--webapp").ToArray();
 
 if (cliArgs.Length == 1 && cliArgs[0] == "--list")
 {
@@ -52,6 +55,11 @@ if (cliArgs.Length == 3 && cliArgs[0] == "--local")
 if (cliArgs.Length == 3 && cliArgs[0] == "--compare-files")
 {
     return CompareLocalFiles(cliArgs[1], cliArgs[2]);
+}
+
+if (cliArgs.Length == 2 && cliArgs[0] == "--explore-webapp")
+{
+    return await ExploreWebApp(cliArgs[1], environments);
 }
 
 
@@ -170,10 +178,88 @@ for (int i = 0; i < successful.Count; i++)
     }
 }
 
+// ─── App config comparison (--webapp) ───────────────────────────────────────
+var webAppPairResults = new List<(string PairKey, List<ComparisonResult> AppResults)>();
+
+if (webAppMode && successful.Count >= 2)
+{
+    Console.WriteLine("App Configuration Comparison");
+    Console.WriteLine(new string('─', 60));
+    Console.WriteLine();
+
+    // Extract IIS app physical paths from each successfully-fetched config
+    var appPathsByEnv = new Dictionary<string, List<(string AppName, string WindowsPath)>>(
+        StringComparer.OrdinalIgnoreCase);
+
+    foreach (var (envName, xml) in successful)
+    {
+        var paths = ExtractAppPhysicalPaths(xml);
+        appPathsByEnv[envName] = paths;
+        Console.WriteLine($"  '{envName}': {paths.Count} IIS applications found.");
+    }
+
+    Console.WriteLine();
+
+    // Fetch webapp configs per env
+    var webAppFiles = new Dictionary<string, List<WebAppConfigFile>>(StringComparer.OrdinalIgnoreCase);
+    var webFetcher  = new WebAppConfigFetcher();
+
+    foreach (var env in targets.Where(e => appPathsByEnv.ContainsKey(e.Name)))
+    {
+        Console.Write($"  Fetching app configs from '{env.Name}'... ");
+        try
+        {
+            var files = await webFetcher.FetchAsync(env, appPathsByEnv[env.Name]);
+            webAppFiles[env.Name] = files;
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"OK ({files.Count} config file(s))");
+            Console.ResetColor();
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"FAILED: {ex.Message}");
+            Console.ResetColor();
+        }
+    }
+
+    Console.WriteLine();
+
+    // Compare each pair
+    var webComparer = new WebAppConfigComparer();
+
+    for (int i = 0; i < successful.Count; i++)
+    {
+        for (int j = i + 1; j < successful.Count; j++)
+        {
+            var leftName  = successful[i].Key;
+            var rightName = successful[j].Key;
+
+            if (!webAppFiles.TryGetValue(leftName,  out var leftFiles))  continue;
+            if (!webAppFiles.TryGetValue(rightName, out var rightFiles)) continue;
+
+            var leftEnv  = targets.FirstOrDefault(e => e.Name == leftName);
+            var rightEnv = targets.FirstOrDefault(e => e.Name == rightName);
+
+            var appDiffs = webComparer.Compare(
+                leftFiles, leftName, rightFiles, rightName,
+                leftEnv  is not null ? new[] { leftEnv.Host }  : null,
+                rightEnv is not null ? new[] { rightEnv.Host } : null);
+
+            var pairKey = $"{leftName} ↔ {rightName}";
+            webAppPairResults.Add((pairKey, appDiffs));
+
+            PrintWebAppResults(leftName, rightName, appDiffs);
+            if (appDiffs.Count > 0) exitCode = 2;
+        }
+    }
+}
+
 if (htmlOutput && results.Count > 0)
 {
-    var generator = new HtmlReportGenerator();
-    var html = generator.Generate(results, failed);
+    var generator  = new HtmlReportGenerator();
+    var html = generator.Generate(results, failed,
+        webAppPairResults.Count > 0 ? webAppPairResults : null);
     var reportPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         $"iis-compare-{DateTime.Now:yyyyMMdd-HHmmss}.html");
@@ -315,6 +401,143 @@ static async Task<int> SaveConfigToFile(
         Console.ResetColor();
         return 1;
     }
+}
+
+/// <summary>
+/// Lists all IIS app config files found on an environment using already-known app paths.
+/// </summary>
+static async Task<int> ExploreWebApp(string envName, List<EnvironmentConfig> environments)
+{
+    var env = environments.FirstOrDefault(e =>
+        e.Name.Equals(envName, StringComparison.OrdinalIgnoreCase));
+    if (env is null) { Console.Error.WriteLine($"Unknown environment: {envName}"); return 1; }
+
+    Console.WriteLine($"Fetching IIS config from '{env.Name}' to discover app paths...");
+    var fetchers = new List<IConfigFetcher> { new UncConfigFetcher(), new WinRmConfigFetcher(), new SshConfigFetcher() };
+    var iisXml = await new ConfigFetcherFactory(fetchers).FetchAsync(env);
+    var appPaths = ExtractAppPhysicalPaths(iisXml);
+    Console.WriteLine($"  Found {appPaths.Count} IIS applications.");
+    Console.WriteLine();
+
+    Console.WriteLine("Scanning for config files...");
+    var files = await new WebAppConfigFetcher().FetchAsync(env, appPaths);
+
+    if (files.Count == 0)
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("  No config files found.");
+        Console.ResetColor();
+        return 0;
+    }
+
+    foreach (var app in files.GroupBy(f => f.AppName).OrderBy(g => g.Key))
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"\n  [{app.Key}]");
+        Console.ResetColor();
+        foreach (var file in app)
+            Console.WriteLine($"    {file.FileName}  ({file.Content.Split('\n').Length} lines)");
+    }
+
+    Console.WriteLine();
+    Console.ForegroundColor = ConsoleColor.Green;
+    Console.WriteLine($"Total: {files.Count} config file(s) across {files.Select(f => f.AppName).Distinct().Count()} app(s).");
+    Console.ResetColor();
+    return 0;
+}
+
+/// <summary>
+/// Extracts IIS application physical paths from ApplicationHost.config XML,
+/// returning (appName, windowsPath) where appName is the last segment of the path.
+/// </summary>
+static List<(string AppName, string WindowsPath)> ExtractAppPhysicalPaths(string applicationHostXml)
+{
+    var result = new List<(string, string)>();
+    var seen   = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    try
+    {
+        var doc   = System.Xml.Linq.XDocument.Parse(applicationHostXml);
+        var sites = doc.Descendants("site");
+
+        foreach (var site in sites)
+        {
+            foreach (var app in site.Descendants("application"))
+            {
+                var vdir  = app.Descendants("virtualDirectory").FirstOrDefault();
+                var physPath = vdir?.Attribute("physicalPath")?.Value;
+                if (string.IsNullOrWhiteSpace(physPath)) continue;
+
+                // Normalise environment variables like %SystemDrive% if present
+                physPath = physPath.Trim();
+
+                var appName = Path.GetFileName(physPath.TrimEnd('\\'));
+                if (string.IsNullOrEmpty(appName)) continue;
+
+                // Deduplicate by physical path
+                if (!seen.Add(physPath)) continue;
+                result.Add((appName, physPath));
+            }
+        }
+    }
+    catch { /* ignore parse errors */ }
+
+    return result;
+}
+
+/// <summary>Prints webapp comparison results to the console.</summary>
+static void PrintWebAppResults(string leftName, string rightName, List<ComparisonResult> appDiffs)
+{
+    var header = $"  {leftName}  ←→  {rightName}  [App Configuration]";
+    Console.WriteLine(header);
+    Console.WriteLine(new string('─', Math.Max(header.Length, 40)));
+
+    if (appDiffs.Count == 0)
+    {
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine("  ✓ All app configurations are identical (ignoring env-specific values).");
+        Console.ResetColor();
+    }
+    else
+    {
+        var totalDiffs = appDiffs.Sum(r => r.Differences.Count);
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"  {appDiffs.Count} app(s) with {totalDiffs} difference(s):");
+        Console.ResetColor();
+        Console.WriteLine();
+
+        foreach (var appResult in appDiffs)
+        {
+            var byFile = appResult.Differences.GroupBy(d =>
+            {
+                // ElementPath is "web.config/appSettings/key" — extract the file part
+                var slash = d.ElementPath.IndexOf('/');
+                return slash >= 0 ? d.ElementPath[..slash] : d.ElementPath;
+            });
+
+            foreach (var fileGroup in byFile)
+            {
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"  [{appResult.Differences.First().Section} / {fileGroup.Key}]");
+                Console.ResetColor();
+
+                foreach (var diff in fileGroup)
+                {
+                    Console.ForegroundColor = diff.Kind switch
+                    {
+                        DifferenceKind.OnlyInLeft  => ConsoleColor.Red,
+                        DifferenceKind.OnlyInRight => ConsoleColor.Blue,
+                        _                          => ConsoleColor.Yellow
+                    };
+                    Console.WriteLine($"    {diff}");
+                    Console.ResetColor();
+                }
+                Console.WriteLine();
+            }
+        }
+    }
+
+    Console.WriteLine();
 }
 
 static async Task<int> CompareLocalVsRemote(

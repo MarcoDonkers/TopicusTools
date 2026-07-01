@@ -127,7 +127,7 @@ class JiraClient:
             return False
 
     # ------------------------------------------------------------------
-    # REST API — new-tab navigation approach
+    # REST API — new-tab navigation approach (GET)
     # ------------------------------------------------------------------
 
     async def _page_fetch(self, url: str, params: dict | None = None) -> dict:
@@ -150,6 +150,36 @@ class JiraClient:
             return json.loads(content)
         finally:
             await api_page.close()
+
+    async def _api_call(
+        self, method: str, path: str, body: dict | None = None
+    ) -> dict:
+        """
+        Make a non-GET REST call (PUT/POST/DELETE) using browser-context
+        fetch(). The main page must already be on the Jira domain, which is
+        guaranteed after ensure_logged_in().
+        """
+        url = f"{JIRA_BASE}{path}" if path.startswith("/") else path
+        result = await self.page.evaluate(
+            """async ([method, url, body]) => {
+                const resp = await fetch(url, {
+                    method,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                    },
+                    credentials: 'include',
+                    body: body !== null ? JSON.stringify(body) : undefined,
+                });
+                return { status: resp.status, body: await resp.text() };
+            }""",
+            [method, url, body],
+        )
+        if result["status"] >= 400:
+            raise RuntimeError(
+                f"Jira API {method} {result['status']} for {url}\n{result['body'][:500]}"
+            )
+        return json.loads(result["body"]) if result["body"].strip() else {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -205,4 +235,27 @@ class JiraClient:
         return await self._page_fetch(
             f"{JIRA_BASE}/rest/api/3/issue/{issue_key}",
             params=params,
+        )
+
+    async def assign_issue(self, issue_key: str, account_id: str) -> None:
+        """Assign an issue to a user by accountId."""
+        await self._api_call(
+            "PUT",
+            f"/rest/api/3/issue/{issue_key}/assignee",
+            {"accountId": account_id},
+        )
+
+    async def get_transitions(self, issue_key: str) -> list[dict]:
+        """Return available transitions for an issue."""
+        data = await self._page_fetch(
+            f"{JIRA_BASE}/rest/api/3/issue/{issue_key}/transitions"
+        )
+        return data.get("transitions", [])
+
+    async def transition_issue(self, issue_key: str, transition_id: str) -> None:
+        """Apply a transition to an issue."""
+        await self._api_call(
+            "POST",
+            f"/rest/api/3/issue/{issue_key}/transitions",
+            {"transition": {"id": transition_id}},
         )

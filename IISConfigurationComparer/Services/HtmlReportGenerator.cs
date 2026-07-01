@@ -5,7 +5,8 @@ namespace IISConfigurationComparer.Services;
 
 public class HtmlReportGenerator
 {
-    public string Generate(List<ComparisonResult> results, List<string> fetchErrors)
+    public string Generate(List<ComparisonResult> results, List<string> fetchErrors,
+        List<(string PairKey, List<ComparisonResult> AppResults)>? webAppResults = null)
     {
         var sb = new StringBuilder();
         var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
@@ -74,6 +75,9 @@ public class HtmlReportGenerator
                 .legend-item { display: flex; align-items: center; gap: 6px; }
                 .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
                 footer { text-align: center; padding: 32px; color: #999; font-size: 0.78rem; }
+                .section-heading { font-size: 1.15rem; font-weight: 700; color: #1a1a2e;
+                                    margin: 40px 0 16px; padding-bottom: 8px;
+                                    border-bottom: 2px solid #1a1a2e; }
               </style>
             </head>
             <body>
@@ -197,6 +201,111 @@ public class HtmlReportGenerator
             }
 
             sb.AppendLine("</div>"); // .comparison
+        }
+
+        // ── Web application config section ──────────────────────────────────────
+        if (webAppResults is { Count: > 0 })
+        {
+            sb.AppendLine("""<h2 class="section-heading">App Configuration Differences</h2>""");
+
+            foreach (var (pairKey, appResults) in webAppResults)
+            {
+                if (appResults.Count == 0)
+                {
+                    sb.AppendLine($"""
+                        <div class="comparison">
+                          <div class="comparison-header">
+                            <span class="env-badge">{HtmlEncode(pairKey.Split('↔')[0].Trim())}</span>
+                            <span class="arrow">↔</span>
+                            <span class="env-badge">{HtmlEncode(pairKey.Split('↔').LastOrDefault()?.Trim())}</span>
+                            <h2 style="margin-left:auto; opacity:.7; font-size:.85rem;">✓ All app configs identical</h2>
+                          </div>
+                          <div class="identical-msg">✓ No non-environment differences found across all applications.</div>
+                        </div>
+                        """);
+                    continue;
+                }
+
+                // Group all app differences by app name (= Section)
+                var byApp = appResults
+                    .SelectMany(r => r.Differences.Select(d => (d, r)))
+                    .GroupBy(x => x.d.Section)
+                    .OrderBy(g => g.Key);
+
+                var leftEnv  = appResults.First().LeftEnvironment;
+                var rightEnv = appResults.First().RightEnvironment;
+                var totalDiffs = appResults.Sum(r => r.Differences.Count);
+
+                sb.AppendLine($"""
+                    <div class="comparison">
+                      <div class="comparison-header">
+                        <span class="env-badge">{HtmlEncode(leftEnv)}</span>
+                        <span class="arrow">↔</span>
+                        <span class="env-badge">{HtmlEncode(rightEnv)}</span>
+                        <h2 style="margin-left:auto; opacity:.7; font-size:.85rem;">{totalDiffs} app config difference(s)</h2>
+                      </div>
+                    """);
+
+                foreach (var appGroup in byApp)
+                {
+                    var appName = appGroup.Key;
+                    var diffs = appGroup.Select(x => x.d).ToList();
+                    var sectionId = $"wa-{Guid.NewGuid():N}";
+
+                    sb.AppendLine($"""
+                        <div class="section-block">
+                          <div class="section-title" onclick="toggle('{sectionId}')">
+                            <span>{HtmlEncode(appName)}</span>
+                            <span class="section-count">{diffs.Count}</span>
+                          </div>
+                          <div id="{sectionId}">
+                            <table class="diff-table">
+                        """);
+
+                    foreach (var diff in diffs)
+                    {
+                        var (kindClass, kindLabel) = diff.Kind switch
+                        {
+                            DifferenceKind.OnlyInLeft  => ("kind-left",  "Only in left"),
+                            DifferenceKind.OnlyInRight => ("kind-right", "Only in right"),
+                            DifferenceKind.AttributeDifference => ("kind-attr", "Value differs"),
+                            _ => ("kind-attr", "Differs")
+                        };
+
+                        // Strip the app name prefix from ElementPath for display
+                        var shortPath = diff.ElementPath.StartsWith(appName + "/", StringComparison.OrdinalIgnoreCase)
+                            ? diff.ElementPath[(appName.Length + 1)..]
+                            : diff.ElementPath;
+
+                        string valCell = diff.Kind == DifferenceKind.AttributeDifference
+                            ? $"<span class=\"val-old\">{HtmlEncode(diff.LeftValue)}</span>"
+                              + $"&nbsp;→&nbsp;<span class=\"val-new\">{HtmlEncode(diff.RightValue)}</span>"
+                            : diff.Kind == DifferenceKind.OnlyInLeft
+                                ? $"<span class=\"val-old\">{HtmlEncode(diff.LeftValue)}</span> (present in <strong>{HtmlEncode(leftEnv)}</strong> only)"
+                                : $"<span class=\"val-new\">{HtmlEncode(diff.RightValue)}</span> (present in <strong>{HtmlEncode(rightEnv)}</strong> only)";
+
+                        sb.AppendLine($"""
+                            <tr>
+                              <td class="kind {kindClass}">{kindLabel}</td>
+                              <td class="path">{HtmlEncode(shortPath)}</td>
+                              <td>{valCell}</td>
+                            </tr>
+                            """);
+                    }
+
+                    sb.AppendLine("</table></div></div>");
+                }
+
+                sb.AppendLine("""
+                    <div class="legend">
+                      <div class="legend-item"><div class="legend-dot" style="background:#dc2626"></div> Only in left environment</div>
+                      <div class="legend-item"><div class="legend-dot" style="background:#2563eb"></div> Only in right environment</div>
+                      <div class="legend-item"><div class="legend-dot" style="background:#d97706"></div> Value differs between environments</div>
+                    </div>
+                    """);
+
+                sb.AppendLine("</div>"); // .comparison
+            }
         }
 
         sb.AppendLine("""

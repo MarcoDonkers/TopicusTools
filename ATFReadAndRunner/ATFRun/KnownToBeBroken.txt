@@ -1,0 +1,4 @@
+# Tests known to be broken — excluded from reruns.
+# Add one test ID per line (without the S/R prefix).
+# Lines starting with # are comments and are ignored.
+128_Portaal_Renteafkoop

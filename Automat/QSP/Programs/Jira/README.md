@@ -20,7 +20,9 @@ playwright install chromium
 
 | Script | Purpose |
 |--------|---------|
+| `start_workday.py` | Daily workday overview: my assigned tickets + unassigned free-to-pick-up tickets |
 | `fetch_ta_tasks.py` | Fetch open Technical Analysis tasks (free to pick up or in-progress for current user) |
+| `board_overview.py` | Full sprint board overview for Artemis (all stories + subtasks) |
 
 ## Running
 

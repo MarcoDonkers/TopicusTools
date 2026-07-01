@@ -41,6 +41,14 @@ Automat/
 
 ---
 
+## Local Codebases
+
+| Codebase    | Path                              | Notes                                          |
+|-------------|-----------------------------------|------------------------------------------------|
+| QSP.Core    | `C:\WorkEnvironment\QSP.Core\`    | Main QSP application; solution file: `FinGen.QSP.sln`. Contains `Force.Financieel`, `FORCE.Provisie`, `FinGen.Documentgeneratie`, `Database/` etc. |
+
+---
+
 ## External Integrations
 
 | System  | Access Method                              | Notes                                          |
