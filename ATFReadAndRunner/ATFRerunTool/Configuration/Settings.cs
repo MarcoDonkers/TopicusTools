@@ -2,13 +2,22 @@ namespace ATFRerunTool.Configuration;
 
 public sealed class Settings
 {
-    public string TestDllPath { get; set; } = "";
+    /// <summary>Path to the QSP.Core git repository. All repo-relative paths are derived from this.</summary>
+    public string GitRepoPath { get; set; } = "";
 
-    public string NUnitConsolePath { get; set; } = "";
+    public string TestDllRelativePath { get; set; } =
+        @"FinGen.WebApplication.SysteemTest\bin\FinGen.WebApplication.SysteemTest.dll";
 
-    /// <summary>
-    /// Absolute path, or relative to the executable directory.
-    /// </summary>
+    public string NUnitConsoleRelativePath { get; set; } =
+        @"packages\NUnit.ConsoleRunner\tools\nunit3-console.exe";
+
+    public string ConfigScriptRelativePath { get; set; } =
+        @"Tools\Powershell\TransformConfig.ps1";
+
+    public string TestDllPath => Path.Combine(GitRepoPath, TestDllRelativePath);
+    public string NUnitConsolePath => Path.Combine(GitRepoPath, NUnitConsoleRelativePath);
+
+    /// <summary>Absolute path, or relative to the executable directory.</summary>
     public string ResultsOutputDirectory { get; set; } = "Results";
 
     public int MaxRerunCount { get; set; } = 3;
@@ -22,7 +31,23 @@ public sealed class Settings
     /// </summary>
     public int OverrideMaxWaitTimeStatusChangeMs { get; set; } = 60000;
 
+    public List<EnvironmentEntry> Environments { get; set; } = [];
+
+    public DatabaseResetSettings DatabaseReset { get; set; } = new();
+
     public JenkinsSettings Jenkins { get; set; } = new();
+}
+
+public sealed class EnvironmentEntry
+{
+    public string Number { get; set; } = "";
+    public string Host { get; set; } = "";
+}
+
+public sealed class DatabaseResetSettings
+{
+    /// <summary>S-only category that initialises the database; runs alone before all other tests.</summary>
+    public string SetupCategory { get; set; } = "S000_BasisOpzetten";
 }
 
 public sealed class JenkinsSettings

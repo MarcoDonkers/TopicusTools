@@ -2,6 +2,7 @@ using ATFRerunTool.Configuration;
 using ATFRerunTool.Orchestration;
 using ATFRerunTool.Parsing;
 using ATFRerunTool.Reporting;
+using ATFRerunTool.Running;
 using System.Diagnostics;
 using System.Text.Json;
 
@@ -223,6 +224,9 @@ internal static class Program
         }
 
 
+        // Ask if the database was reset
+        bool dbWasReset = AskDatabaseReset(settings);
+
         if (jobs.Count == 0)
         {
             Console.WriteLine("No failing jobs to rerun. All clear!");
@@ -235,8 +239,11 @@ internal static class Program
 
         Console.WriteLine($"\nResults folder: {settings.ResultsOutputDirectory}");
 
+        // Ask for branch to test on
+        AskBranch(settings);
+
         // Ask for environment and apply config
-        ApplyEnvironmentConfig();
+        ApplyEnvironmentConfig(settings);
 
         // Ask about retries (default: No — run once without extra rounds)
         settings.MaxRerunCount = AskRetries(settings.MaxRerunCount);
@@ -250,13 +257,13 @@ internal static class Program
             if (!File.Exists(settings.NUnitConsolePath))
             {
                 Console.Error.WriteLine($"Error: nunit3-console.exe not found at: {settings.NUnitConsolePath}");
-                Console.Error.WriteLine("Update NUnitConsolePath in appsettings.json.");
+                Console.Error.WriteLine("Check GitRepoPath in appsettings.json.");
                 return 1;
             }
             if (!File.Exists(settings.TestDllPath))
             {
                 Console.Error.WriteLine($"Error: Test DLL not found at: {settings.TestDllPath}");
-                Console.Error.WriteLine("Build the ATF solution first, or update TestDllPath in appsettings.json.");
+                Console.Error.WriteLine("Build the ATF solution first, or check GitRepoPath in appsettings.json.");
                 return 1;
             }
         }
@@ -269,6 +276,10 @@ internal static class Program
             Console.WriteLine("\nCancellation requested – finishing current test and saving report...");
             cts.Cancel();
         };
+
+        // If DB was reset, run S000_BasisOpzetten alone before handing off to the orchestrator
+        if (dbWasReset && !settings.Jenkins.Enabled)
+            await RunDatabaseSetupAsync(settings, cts.Token);
 
         var orchestrator = new RerunOrchestrator(settings);
         var session = await orchestrator.RunAsync(runName, jobs, cts.Token);
@@ -355,41 +366,329 @@ internal static class Program
         return 0;
     }
 
+    // ─── Branch Picker ───────────────────────────────────────────────────────
+
+    private record GitBranch(string Name, bool IsCurrent, DateTime? LastCommit);
+
+    private static List<GitBranch>? GetGitBranches(string repoPath)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "git",
+                WorkingDirectory = repoPath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("branch");
+            psi.ArgumentList.Add("--sort=-committerdate");
+            psi.ArgumentList.Add("--format=%(HEAD)|%(refname:short)|%(committerdate:iso8601)");
+
+            using var proc = new Process { StartInfo = psi };
+            proc.Start();
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit();
+            if (proc.ExitCode != 0) return null;
+
+            var branches = new List<GitBranch>();
+            foreach (var raw in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = raw.Split('|');
+                if (parts.Length < 2) continue;
+                bool isCurrent = parts[0].Trim() == "*";
+                var name = parts[1].Trim();
+                DateTime? date = null;
+                if (parts.Length >= 3 && DateTimeOffset.TryParse(parts[2].Trim(), out var dto))
+                    date = dto.LocalDateTime;
+                if (!string.IsNullOrEmpty(name))
+                    branches.Add(new GitBranch(name, isCurrent, date));
+            }
+            return branches;
+        }
+        catch { return null; }
+    }
+
+    private static void CheckoutBranch(string repoPath, string branchName)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"  → Checking out: {branchName}...");
+        Console.ResetColor();
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = repoPath,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        psi.ArgumentList.Add("checkout");
+        psi.ArgumentList.Add(branchName);
+
+        using var proc = new Process { StartInfo = psi };
+        proc.Start();
+        var stderr = proc.StandardError.ReadToEnd();
+        proc.WaitForExit();
+
+        if (proc.ExitCode != 0)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"  Git checkout failed: {stderr.Trim()}");
+            Console.ResetColor();
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"  ✓ Switched to: {branchName}");
+            Console.ResetColor();
+        }
+    }
+
+    private static void AskBranch(Settings settings)
+    {
+        if (string.IsNullOrEmpty(settings.GitRepoPath) || !Directory.Exists(settings.GitRepoPath))
+            return;
+
+        var branches = GetGitBranches(settings.GitRepoPath);
+        if (branches is null || branches.Count == 0) return;
+
+        var currentName = branches.FirstOrDefault(b => b.IsCurrent)?.Name ?? "(none)";
+        int selectedIdx = Math.Max(0, branches.FindIndex(b => b.IsCurrent));
+
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"Select branch (current: {currentName}):");
+        Console.ResetColor();
+
+        const int maxVisible = 10;
+        // fixed area height: top-scroll + list + bottom-scroll + search + hint
+        const int totalLines = maxVisible + 4;
+
+        int listStartRow = Console.CursorTop;
+        for (int i = 0; i < totalLines; i++) Console.WriteLine(); // reserve space
+
+        string filter = "";
+
+        while (true)
+        {
+            var filtered = branches
+                .Where(b => string.IsNullOrEmpty(filter) ||
+                            b.Name.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (selectedIdx >= filtered.Count)
+                selectedIdx = Math.Max(0, filtered.Count - 1);
+
+            int windowStart = Math.Max(0, selectedIdx - maxVisible / 2);
+            if (windowStart + maxVisible > filtered.Count)
+                windowStart = Math.Max(0, filtered.Count - maxVisible);
+            int windowEnd = Math.Min(filtered.Count, windowStart + maxVisible);
+
+            Console.SetCursorPosition(0, listStartRow);
+
+            // Top scroll indicator
+            BranchPrintLine(windowStart > 0 ? $"  ↑ {windowStart} more" : "");
+
+            // Branch list (always maxVisible rows)
+            for (int row = 0; row < maxVisible; row++)
+            {
+                int idx = windowStart + row;
+                if (idx < windowEnd)
+                {
+                    var b = filtered[idx];
+                    bool sel = idx == selectedIdx;
+
+                    if (sel) { Console.BackgroundColor = ConsoleColor.DarkCyan; Console.ForegroundColor = ConsoleColor.White; }
+                    else if (b.IsCurrent) { Console.ForegroundColor = ConsoleColor.Green; }
+
+                    var marker = b.IsCurrent ? "*" : " ";
+                    var dateStr = b.LastCommit?.ToString("yyyy-MM-dd") ?? "          ";
+                    BranchPrintLine($"  {marker} {b.Name,-50} {dateStr}");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    BranchPrintLine("");
+                }
+            }
+
+            // Bottom scroll indicator
+            BranchPrintLine(windowEnd < filtered.Count ? $"  ↓ {filtered.Count - windowEnd} more" : "");
+
+            // Search input
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            BranchPrintLine($"  Search: {filter}█");
+            Console.ResetColor();
+
+            // Hint (no trailing newline — last line of reserved area)
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            var hint = "  Enter=checkout  Esc=keep current  ↑↓=navigate  Backspace=clear";
+            Console.Write(hint.PadRight(Math.Max(hint.Length, Console.WindowWidth - 1)));
+            Console.ResetColor();
+
+            var key = Console.ReadKey(intercept: true);
+
+            switch (key.Key)
+            {
+                case ConsoleKey.Escape:
+                    BranchClearArea(listStartRow, totalLines);
+                    Console.SetCursorPosition(0, listStartRow);
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.WriteLine($"  Branch unchanged: {currentName}");
+                    Console.ResetColor();
+                    Console.WriteLine();
+                    return;
+
+                case ConsoleKey.Enter:
+                    if (filtered.Count == 0) break;
+                    var chosen = filtered[selectedIdx];
+                    BranchClearArea(listStartRow, totalLines);
+                    Console.SetCursorPosition(0, listStartRow);
+
+                    if (chosen.IsCurrent)
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine($"  Branch unchanged: {chosen.Name}");
+                        Console.ResetColor();
+                        Console.WriteLine();
+                        return;
+                    }
+
+                    // Check for uncommitted changes before switching
+                    var dirtyFiles = GetDirtyFiles(settings.GitRepoPath);
+                    if (dirtyFiles.Count > 0)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"  Uncommitted changes on '{currentName}':");
+                        Console.ResetColor();
+                        foreach (var df in dirtyFiles)
+                        {
+                            Console.ForegroundColor = ConsoleColor.DarkYellow;
+                            Console.WriteLine($"    {df}");
+                            Console.ResetColor();
+                        }
+                        Console.WriteLine();
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.Write($"  Discard all changes and switch to '{chosen.Name}'? [y/N]: ");
+                        Console.ResetColor();
+                        var confirm = Console.ReadLine()?.Trim().ToLowerInvariant();
+                        if (confirm is not ("y" or "yes"))
+                        {
+                            Console.ForegroundColor = ConsoleColor.DarkGray;
+                            Console.WriteLine("  Branch unchanged.");
+                            Console.ResetColor();
+                            Console.WriteLine();
+                            return;
+                        }
+                        DiscardChanges(settings.GitRepoPath);
+                    }
+
+                    CheckoutBranch(settings.GitRepoPath, chosen.Name);
+                    Console.WriteLine();
+                    return;
+
+                case ConsoleKey.UpArrow:
+                    if (selectedIdx > 0) selectedIdx--;
+                    break;
+
+                case ConsoleKey.DownArrow:
+                    if (filtered.Count > 0 && selectedIdx < filtered.Count - 1) selectedIdx++;
+                    break;
+
+                case ConsoleKey.Backspace:
+                    if (filter.Length > 0) { filter = filter[..^1]; selectedIdx = 0; }
+                    break;
+
+                default:
+                    if (!char.IsControl(key.KeyChar) && key.KeyChar != '\0')
+                    { filter += key.KeyChar; selectedIdx = 0; }
+                    break;
+            }
+        }
+    }
+
+    private static List<string> GetDirtyFiles(string repoPath)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "git",
+                WorkingDirectory = repoPath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("status");
+            psi.ArgumentList.Add("--porcelain");
+
+            using var proc = new Process { StartInfo = psi };
+            proc.Start();
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit();
+
+            return output
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Where(line => line.Length >= 2 && line[..2] != "??") // ignore untracked
+                .ToList();
+        }
+        catch { return []; }
+    }
+
+    private static void DiscardChanges(string repoPath)
+    {
+        // Unstage then restore working tree; ignore errors (e.g. nothing staged)
+        RunSilentGit(repoPath, "restore", "--staged", ".");
+        RunSilentGit(repoPath, "restore", ".");
+    }
+
+    private static void RunSilentGit(string repoPath, params string[] args)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = repoPath,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        foreach (var arg in args) psi.ArgumentList.Add(arg);
+        using var proc = new Process { StartInfo = psi };
+        proc.Start();
+        proc.WaitForExit();
+    }
+
+    private static void BranchPrintLine(string content)
+    {
+        int w = Console.WindowWidth - 1;
+        Console.WriteLine(w > content.Length ? content.PadRight(w) : content);
+    }
+
+    private static void BranchClearArea(int startRow, int lines)
+    {
+        Console.SetCursorPosition(0, startRow);
+        int w = Math.Max(1, Console.WindowWidth - 1);
+        for (int i = 0; i < lines; i++)
+            Console.WriteLine(new string(' ', w));
+    }
+
     // ─── Environment config ───────────────────────────────────────────────────
 
-    private static readonly (string Number, string Host)[] _environments =
-    [
-        ("1",  "o1.qsp.finance.lab"),
-        ("2",  "o2.qsp.finance.lab"),
-        ("3",  "o3.qsp.finance.lab"),
-        ("6",  "o6.qsp.finance.lab"),
-        ("8",  "o8.qsp.finance.lab"),
-        ("9",  "o9.qsp.finance.lab"),
-        ("10", "o10.qsp.finance.lab"),
-        ("11", "o11.qsp.finance.lab"),
-        ("12", "o12.qsp.finance.lab"),
-        ("13", "o13.qsp.finance.lab"),
-        ("14", "o14.qsp.finance.lab"),
-        ("15", "o15.qsp.finance.lab"),
-        ("16", "o16.qsp.finance.lab"),
-        ("18", "o18.qsp.finance.lab"),
-        ("19", "o19.qsp.finance.lab"),
-        ("20", "o20.qsp.finance.lab"),
-        ("21", "o21.qsp.finance.lab"),
-        ("22", "o22.qsp.finance.lab"),
-        ("23", "o23.qsp.finance.lab"),
-        ("24", "o24.qsp.finance.lab"),
-    ];
-
-    private static void ApplyEnvironmentConfig()
+    private static void ApplyEnvironmentConfig(Settings settings)
     {
         Console.WriteLine();
         Console.ForegroundColor = ConsoleColor.Yellow;
         Console.WriteLine("Select environment:");
         Console.ResetColor();
 
-        foreach (var (num, host) in _environments)
-            Console.WriteLine($"  {num,3}) {host}");
+        foreach (var env in settings.Environments)
+            Console.WriteLine($"  {env.Number,3}) {env.Host}");
 
         string? envHost = null;
         while (envHost is null)
@@ -399,7 +698,7 @@ internal static class Program
             Console.ResetColor();
 
             var input = Console.ReadLine()?.Trim();
-            envHost = _environments.FirstOrDefault(e => e.Number == input).Host;
+            envHost = settings.Environments.FirstOrDefault(e => e.Number == input)?.Host;
 
             if (envHost is null)
                 Console.WriteLine($"  \"{input}\" is not a valid option.");
@@ -407,15 +706,13 @@ internal static class Program
 
         Console.WriteLine($"  → Configuring for {envHost}...");
 
-        var configBat = @"C:\WorkEnvironment\QSP.Core\QSP.ATF.Config (keuzemenu).bat";
-        var configDir = Path.GetDirectoryName(configBat)!;
-        var psScript = Path.Combine(configDir, @"Tools\Powershell\TransformConfig.ps1");
+        var psScript = Path.Combine(settings.GitRepoPath, settings.ConfigScriptRelativePath);
 
         var psi = new ProcessStartInfo
         {
             FileName = "powershell.exe",
             Arguments = $"-ExecutionPolicy Bypass -File \"{psScript}\" -environment \"{envHost}\"",
-            WorkingDirectory = configDir,
+            WorkingDirectory = settings.GitRepoPath,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -441,6 +738,58 @@ internal static class Program
             Console.WriteLine($"  Config applied.");
             Console.ResetColor();
         }
+    }
+
+    // ─── Database Reset ───────────────────────────────────────────────────────
+
+    private static bool AskDatabaseReset(Settings settings)
+    {
+        if (string.IsNullOrEmpty(settings.DatabaseReset.SetupCategory))
+            return false;
+
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.Write("Was the database reset? [y/N]: ");
+        Console.ResetColor();
+
+        var answer = Console.ReadLine()?.Trim().ToLowerInvariant();
+        return answer is "y" or "yes";
+    }
+
+    private static async Task RunDatabaseSetupAsync(Settings settings, CancellationToken cancellationToken)
+    {
+        var setupCategory = settings.DatabaseReset.SetupCategory;
+        if (string.IsNullOrEmpty(setupCategory)) return;
+
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"Running database setup: {setupCategory}...");
+        Console.ResetColor();
+
+        var setupJob = new ATFRerunTool.Models.TestJob
+        {
+            TestId = setupCategory.StartsWith("S", StringComparison.OrdinalIgnoreCase)
+                ? setupCategory[1..] : setupCategory,
+            CategoryS = setupCategory,
+            HasRTest = false,
+            Source = "DB reset setup",
+        };
+
+        var runner = new LocalTestRunner(settings);
+        var attempt = await runner.RunAsync(setupJob, ATFRerunTool.Models.TestVariant.State, 1, cancellationToken);
+
+        if (attempt.Passed)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"  ✓ {setupCategory} passed — proceeding with tests.");
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"  Warning: {setupCategory} did not pass. Proceeding anyway.");
+        }
+        Console.ResetColor();
+        Console.WriteLine();
     }
 
     // ─── File Picker ──────────────────────────────────────────────────────────

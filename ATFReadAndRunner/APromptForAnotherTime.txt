@@ -1,0 +1,7 @@
+I want to add another feature to the tool, I have another project / tool which can be found here:
+  "C:\WorkEnvironment\TopicusTools\IISConfigurationComparer" in here I actually access the servers against which the
+  ATF is ran directly for my reports I want to initially clean the logging so that afterwards I can retrieve all the
+  logs and specifically errors so we can look at them in the overview even though these can't be linked to the
+  individual tests it is still nice to see what is going on in the report directly. For now I only want to look at the
+  logging of QSP.Core later we can broaden this. Which can be found here: E:\Logs\QSP\webapp the files look like
+  this: [Image #1]
