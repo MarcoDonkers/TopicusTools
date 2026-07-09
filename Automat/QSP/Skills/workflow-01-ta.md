@@ -66,11 +66,9 @@ Answer the following:
 3. **Wat is de verwachte aanpak?**
    Describe a concrete implementation direction.
 
-4. **Wat zijn de risico's / neveneffecten?**
-   Flag edge cases, performance concerns, regression risk, data migrations, etc.
-
-5. **Schatting**
-   Rough effort estimate in story points or days.
+> **Note:** Risico's / neveneffecten and effort estimates are **not** part of the
+> Technische analyse output. They belong to the separate Risico en dreigingsanalyse
+> sub-task and planning steps respectively.
 
 #### Risico en dreigingsanalyse
 
@@ -90,11 +88,18 @@ Answer the following:
 
 ### 5. Write the analysis to Jira
 
-Once the analysis is complete and Marco has approved it, offer to update the
-**description field of the story being analysed** (not the TA task itself,
-and not as a comment):
+**Human checkpoint — mandatory.** Always present the full analysis to the user
+and wait for explicit approval **before** calling any Jira write API.
+Do not combine step 4 (producing the analysis) and step 5 (writing it) into a
+single action.
 
-> "Zal ik de analyse in het omschrijving-veld van [story-key] zetten?"
+Once the user has approved, offer to write it:
+
+> "Zal ik de analyse in het omschrijving-veld van [story-key] zetten en het script als bijlage toevoegen?"
+
+Write both in one action:
+1. Update the description via `PUT /rest/api/3/issue/<story-key>`
+2. Attach any SQL scripts via `POST /rest/api/3/issue/<story-key>/attachments` (see SQL script convention below)
 
 The target ticket is the **parent story** (or the story the TA task links to),
 not the TA task (e.g. QSP-99746) itself. The analysis lives in the description
@@ -130,6 +135,44 @@ Key rules for valid ADF:
 - `codeBlock` does not require a `language` attribute.
 
 See `QSP-99202` as a worked example of a complete restructured Technisch section.
+
+---
+
+## Conventions
+
+### Author name
+**Never include the user's name** in Jira descriptions, comments, or SQL scripts. Do not add author attribution anywhere in output that goes to external systems or committed files.
+
+### SQL scripts produced during TA
+When the analysis involves a SQL fix/cleanup script, the script **must always start with a comment block** containing:
+
+```sql
+-- <ticket-key> — <short description>
+-- <month year>
+--
+-- UITVOERPROTOCOL
+-- 1. Voer eerst uit met ROLLBACK + diagnostiek-SELECTs aan — valideer aantallen.
+-- 2. Laat de uitkomst bevestigen.
+-- 3. Voer daarna uit met COMMIT.
+
+BEGIN TRANSACTION
+...
+-- ROLLBACK  ← verwijder deze regel pas nadat aantallen zijn gevalideerd
+COMMIT
+```
+
+The script must also be **attached as a `.sql` file** to the Jira story (in addition to
+being included as a code block in the description). Use the reusable attachment skill:
+
+```
+cd QSP\Programs\Jira
+python attach_to_jira.py <story-key> <path-to-script.sql>
+```
+
+See `QSP/Skills/jira-attachments.md` for full documentation.
+
+Name the file `<ticket-key>_<short_description>.sql`, e.g.
+`QSP-96994_verwijder_vervalkalender_2747912_DL8.sql`.
 
 ---
 

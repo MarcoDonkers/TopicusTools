@@ -77,36 +77,23 @@ public sealed class RerunOrchestrator
                 CancellationToken = cancellationToken,
             };
 
-            await Parallel.ForEachAsync(queue, parallelOptions, async (job, ct) =>
+            // The DB setup job (e.g. S000_BasisOpzetten) must run alone first —
+            // every other test depends on the state it builds.
+            var setupJob = string.IsNullOrEmpty(_settings.DatabaseReset.SetupCategory) ? null
+                : queue.FirstOrDefault(j =>
+                    string.Equals(j.CategoryS, _settings.DatabaseReset.SetupCategory, StringComparison.OrdinalIgnoreCase));
+
+            var parallelQueue = queue;
+            if (setupJob is not null)
             {
-                bool rAlreadyGreen = !job.HasRTest || rPassed.ContainsKey(job.TestId);
-                if (rAlreadyGreen)
-                {
-                    // Should not be in queue, but guard anyway
-                    WriteColored($"  [{job.TestId}] Skipping — already fully green.", ConsoleColor.DarkGray);
-                    return;
-                }
+                if (queue.Count > 1)
+                    WriteColored($"  {setupJob.CategoryS} runs alone first — {queue.Count - 1} other job(s) wait for it.\n", ConsoleColor.Yellow);
+                await RunJobAsync(setupJob, round, rPassed, allAttempts, cancellationToken);
+                parallelQueue = queue.Where(j => !ReferenceEquals(j, setupJob)).ToList();
+            }
 
-                // ── State test — always runs each round ────────────────────
-                var sAttempt = await ExecuteAsync(job, TestVariant.State, round, ct);
-                allAttempts.Add(sAttempt);
-
-                // ── Regression test — only if S passed this round ──────────
-                if (sAttempt.Passed && job.HasRTest)
-                {
-                    var rAttempt = await ExecuteAsync(job, TestVariant.Regression, round, ct);
-                    allAttempts.Add(rAttempt);
-                    if (rAttempt.Passed) rPassed.TryAdd(job.TestId, true);
-                }
-                else if (!sAttempt.Passed && job.HasRTest)
-                {
-                    WriteColored($"  [{job.TestId}] Skipping {job.CategoryR} — S did not pass this round.", ConsoleColor.DarkGray);
-                }
-                else if (sAttempt.Passed && !job.HasRTest)
-                {
-                    rPassed.TryAdd(job.TestId, true); // S-only job, counts as done
-                }
-            });
+            await Parallel.ForEachAsync(parallelQueue, parallelOptions,
+                async (job, ct) => await RunJobAsync(job, round, rPassed, allAttempts, ct));
 
             // Flush bag to session list
             while (allAttempts.TryTake(out var a)) session.AllAttempts.Add(a);
@@ -121,6 +108,42 @@ public sealed class RerunOrchestrator
         session.FinishedAt = DateTime.Now;
         Console.WriteLine($"\nAll rounds complete. Total duration: {session.FinishedAt - session.StartedAt:hh\\:mm\\:ss}");
         return session;
+    }
+
+    private async Task RunJobAsync(
+        TestJob job,
+        int round,
+        ConcurrentDictionary<string, bool> rPassed,
+        ConcurrentBag<TestRunAttempt> allAttempts,
+        CancellationToken ct)
+    {
+        bool alreadyGreen = rPassed.ContainsKey(job.TestId);
+        if (alreadyGreen)
+        {
+            // Should not be in queue, but guard anyway
+            WriteColored($"  [{job.TestId}] Skipping — already fully green.", ConsoleColor.DarkGray);
+            return;
+        }
+
+        // ── State test — always runs each round ────────────────────
+        var sAttempt = await ExecuteAsync(job, TestVariant.State, round, ct);
+        allAttempts.Add(sAttempt);
+
+        // ── Regression test — only if S passed this round ──────────
+        if (sAttempt.Passed && job.HasRTest)
+        {
+            var rAttempt = await ExecuteAsync(job, TestVariant.Regression, round, ct);
+            allAttempts.Add(rAttempt);
+            if (rAttempt.Passed) rPassed.TryAdd(job.TestId, true);
+        }
+        else if (!sAttempt.Passed && job.HasRTest)
+        {
+            WriteColored($"  [{job.TestId}] Skipping {job.CategoryR} — S did not pass this round.", ConsoleColor.DarkGray);
+        }
+        else if (sAttempt.Passed && !job.HasRTest)
+        {
+            rPassed.TryAdd(job.TestId, true); // S-only job, counts as done
+        }
     }
 
     private async Task<TestRunAttempt> ExecuteAsync(

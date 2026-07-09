@@ -64,8 +64,14 @@ Automat/
 
 These are the categories of decision that always require human confirmation, regardless of workflow:
 
-1. **Write to external system** — any create/update/delete on Jira, Git remote, Slack, or similar.
+1. **Write to external system** — any create/update/delete on Jira, Git remote, Slack, or similar. **Always present the exact content to the user first and wait for explicit approval before executing the write.** Never write to an external system in the same step as producing the content.
 2. **Ambiguous story / requirement** — when the agent cannot determine intent with sufficient confidence.
 3. **Branching strategy** — branch names and base branch selection before any `git push`.
 4. **Test guidance** — when automated testing cannot determine how to validate a feature.
 5. **Security / credential handling** — any action involving secrets, tokens, or personal data.
+
+---
+
+## Global Conventions
+
+- **Never include the user's name** in Jira descriptions, comments, stories, or scripts (SQL or otherwise). Do not attribute authorship by name anywhere in written output that goes to external systems or committed files.

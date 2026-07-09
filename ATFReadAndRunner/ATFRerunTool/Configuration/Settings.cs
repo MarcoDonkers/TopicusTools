@@ -36,6 +36,8 @@ public sealed class Settings
     public DatabaseResetSettings DatabaseReset { get; set; } = new();
 
     public JenkinsSettings Jenkins { get; set; } = new();
+
+    public JenkinsLogSourceSettings JenkinsLogSource { get; set; } = new();
 }
 
 public sealed class EnvironmentEntry
@@ -48,6 +50,22 @@ public sealed class DatabaseResetSettings
 {
     /// <summary>S-only category that initialises the database; runs alone before all other tests.</summary>
     public string SetupCategory { get; set; } = "S000_BasisOpzetten";
+}
+
+/// <summary>
+/// Where the S/R Jenkins runs live, for fetching logs directly from Jenkins
+/// instead of manually saved files in the ATFRun folder.
+/// </summary>
+public sealed class JenkinsLogSourceSettings
+{
+    public string StateJobUrl { get; set; } =
+        "https://qsp-ci.topicusfinance.nl/view/3.%20ATF/view/Main%20Jobs/job/QSP-State-Opbouw/";
+
+    public string RegressionJobUrl { get; set; } =
+        "https://qsp-ci.topicusfinance.nl/view/3.%20ATF/view/Main%20Jobs/job/QSP-State-Regressie/";
+
+    /// <summary>How many recent builds to list per job.</summary>
+    public int BuildsToShow { get; set; } = 15;
 }
 
 public sealed class JenkinsSettings

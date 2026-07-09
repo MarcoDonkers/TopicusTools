@@ -62,6 +62,9 @@ suggest running `python login.py` to refresh the session.
 - Confirm ticket key before running (the assignment + transition cannot be undone
   without manually reverting in Jira).
 - Ask the user which workflow to start after presenting the ticket details.
+- **Any subsequent write to Jira** (description, comment, status) requires the
+  user to see the exact content first and give explicit approval before the
+  write is executed. Never produce content and write it in the same step.
 
 ---
 

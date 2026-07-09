@@ -1,10 +1,13 @@
 using ATFRerunTool.Configuration;
+using ATFRerunTool.Jenkins;
 using ATFRerunTool.Orchestration;
 using ATFRerunTool.Parsing;
 using ATFRerunTool.Reporting;
 using ATFRerunTool.Running;
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
 
 namespace ATFRerunTool;
 
@@ -72,16 +75,32 @@ internal static class Program
         // Interactive picker when paths weren't supplied on the command line
         if (sLogPath is null)
         {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("Step 1/2 — Select the STATE (S) Jenkins log:");
-            Console.ResetColor();
-            sLogPath = PickLogFile(settings, allowSkip: false, prefix: "S");
-            if (sLogPath is null) return 0;
+            var startMode = PickStartMode();
+            if (startMode == StartMode.Exit) return 0;
+            if (startMode == StartMode.RunAll)
+                return await RunAllTestsAsync(settings);
 
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("\nStep 2/2 — Select the REGRESSION (R) Jenkins log (or 0 to skip):");
-            Console.ResetColor();
-            rLogPath = PickLogFile(settings, allowSkip: true, prefix: "R");
+            var logSource = PickLogSource();
+            if (logSource == LogSource.Exit) return 0;
+
+            if (logSource == LogSource.Jenkins)
+            {
+                (sLogPath, rLogPath) = await PickJenkinsRunsAsync(settings);
+                if (sLogPath is null) return 0;
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("Step 1/2 — Select the STATE (S) Jenkins log:");
+                Console.ResetColor();
+                sLogPath = PickLogFile(settings, allowSkip: false, prefix: "S");
+                if (sLogPath is null) return 0;
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("\nStep 2/2 — Select the REGRESSION (R) Jenkins log (or 0 to skip):");
+                Console.ResetColor();
+                rLogPath = PickLogFile(settings, allowSkip: true, prefix: "R");
+            }
         }
 
         // Validate
@@ -224,8 +243,12 @@ internal static class Program
         }
 
 
-        // Ask if the database was reset
-        bool dbWasReset = AskDatabaseReset(settings);
+        // Ask if the database was reset — unless the setup job is already in the
+        // list, in which case the orchestrator runs it alone first anyway.
+        bool setupInJobs = ContainsSetupJob(settings, jobs);
+        if (setupInJobs)
+            Console.WriteLine($"\n{settings.DatabaseReset.SetupCategory} is in the job list — it will run alone first; the rest waits for it.");
+        bool dbWasReset = !setupInJobs && AskDatabaseReset(settings);
 
         if (jobs.Count == 0)
         {
@@ -244,6 +267,9 @@ internal static class Program
 
         // Ask for environment and apply config
         ApplyEnvironmentConfig(settings);
+
+        // Ask whether the browser should run headless and patch the test config
+        AskHeadless(settings);
 
         // Ask about retries (default: No — run once without extra rounds)
         settings.MaxRerunCount = AskRetries(settings.MaxRerunCount);
@@ -706,6 +732,15 @@ internal static class Program
 
         Console.WriteLine($"  → Configuring for {envHost}...");
 
+        if (string.IsNullOrEmpty(settings.GitRepoPath) || !Directory.Exists(settings.GitRepoPath))
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.Error.WriteLine($"Error: GitRepoPath '{settings.GitRepoPath}' does not exist.");
+            Console.Error.WriteLine("Set GitRepoPath in appsettings.json to your local QSP.Core repository path.");
+            Console.ResetColor();
+            return;
+        }
+
         var psScript = Path.Combine(settings.GitRepoPath, settings.ConfigScriptRelativePath);
 
         var psi = new ProcessStartInfo
@@ -734,13 +769,131 @@ internal static class Program
         }
         else
         {
+            SyncAppConfigToDllConfig(settings);
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($"  Config applied.");
             Console.ResetColor();
         }
     }
 
+    /// <summary>
+    /// The transform script updates the project's App.config, but NUnit reads the
+    /// DLL's .config next to the built DLL — copy it over so the selected
+    /// environment actually takes effect without a rebuild.
+    /// </summary>
+    private static void SyncAppConfigToDllConfig(Settings settings)
+    {
+        var appConfig = GetAppConfigPath(settings);
+        var dllConfig = settings.TestDllPath + ".config";
+
+        if (appConfig is null || !File.Exists(appConfig) || !File.Exists(dllConfig))
+            return;
+
+        try
+        {
+            File.Copy(appConfig, dllConfig, overwrite: true);
+            Console.WriteLine($"  → Synced App.config to {Path.GetFileName(dllConfig)}");
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"  Warning: could not sync App.config to DLL config: {ex.Message}");
+            Console.WriteLine($"  Tests may run against the wrong environment!");
+            Console.ResetColor();
+        }
+    }
+
+    private static string? GetAppConfigPath(Settings settings)
+    {
+        var projectDir = Path.GetDirectoryName(Path.GetDirectoryName(settings.TestDllPath));
+        return projectDir is null ? null : Path.Combine(projectDir, "App.config");
+    }
+
+    // ─── Headless ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Asks whether the browser should run headless and patches the "Headless"
+    /// appSetting in the test configs (the App.config that TransformConfig.ps1
+    /// maintains, plus the DLL .config that NUnit actually reads at run time).
+    /// </summary>
+    private static void AskHeadless(Settings settings)
+    {
+        var configPaths = GetHeadlessConfigPaths(settings).Where(File.Exists).ToList();
+        if (configPaths.Count == 0) return;
+
+        bool? current = ReadHeadlessSetting(configPaths);
+        var hint = current == false ? "[y/N]" : "[Y/n]";
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.Write($"\nRun ATF headless (no visible browser)? {hint}: ");
+        Console.ResetColor();
+
+        var input = Console.ReadLine()?.Trim().ToLowerInvariant();
+        bool headless = input switch
+        {
+            "y" or "yes" => true,
+            "n" or "no" => false,
+            _ => current ?? true, // Enter keeps the current setting
+        };
+
+        foreach (var path in configPaths)
+            PatchHeadlessSetting(path, headless);
+
+        Console.WriteLine($"  → Headless: {(headless ? "yes" : "no (browser visible)")}");
+    }
+
+    private static readonly Regex HeadlessSettingRegex = new(
+        @"(<add\s+key=""Headless""\s+value="")[^""]*(""\s*/>)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static List<string> GetHeadlessConfigPaths(Settings settings)
+    {
+        var paths = new List<string> { settings.TestDllPath + ".config" };
+        if (GetAppConfigPath(settings) is string appConfig)
+            paths.Add(appConfig);
+        return paths;
+    }
+
+    private static bool? ReadHeadlessSetting(List<string> configPaths)
+    {
+        foreach (var path in configPaths)
+        {
+            try
+            {
+                var match = HeadlessSettingRegex.Match(File.ReadAllText(path));
+                if (match.Success)
+                {
+                    var raw = match.Value;
+                    var value = raw[(raw.IndexOf("value=\"", StringComparison.OrdinalIgnoreCase) + 7)..];
+                    return value.StartsWith("true", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch { /* try next */ }
+        }
+        return null;
+    }
+
+    private static void PatchHeadlessSetting(string configPath, bool headless)
+    {
+        try
+        {
+            var original = File.ReadAllText(configPath);
+            var patched = HeadlessSettingRegex.Replace(original, $"${{1}}{(headless ? "True" : "False")}${{2}}");
+            if (patched != original)
+                File.WriteAllText(configPath, patched);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  Warning: could not set Headless in {configPath}: {ex.Message}");
+        }
+    }
+
     // ─── Database Reset ───────────────────────────────────────────────────────
+
+    /// <summary>True when the DB setup job (e.g. S000_BasisOpzetten) is part of the job list.</summary>
+    private static bool ContainsSetupJob(Settings settings, List<ATFRerunTool.Models.TestJob> jobs) =>
+        !string.IsNullOrEmpty(settings.DatabaseReset.SetupCategory) &&
+        jobs.Any(j => string.Equals(j.CategoryS, settings.DatabaseReset.SetupCategory, StringComparison.OrdinalIgnoreCase));
 
     private static bool AskDatabaseReset(Settings settings)
     {
@@ -1015,5 +1168,458 @@ Rerun logic:
        Remove jobs that fully pass
   4. Generate HTML report with per-round results, error messages and stack traces
 ");
+    }
+
+    // ─── Start-mode Picker ────────────────────────────────────────────────────
+
+    private enum StartMode { Exit, FromLogs, RunAll }
+
+    private static StartMode PickStartMode()
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("Select mode:");
+        Console.ResetColor();
+        Console.WriteLine("  [1]  Rerun failed tests from Jenkins log files (S and/or R)");
+        Console.WriteLine("  [2]  Run all tests (no log files needed — discovers from DLL)");
+        Console.WriteLine("  [0]  Exit");
+        Console.WriteLine();
+
+        while (true)
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.Write("Enter choice: ");
+            Console.ResetColor();
+            var input = Console.ReadLine()?.Trim();
+            switch (input)
+            {
+                case "0": return StartMode.Exit;
+                case "1": return StartMode.FromLogs;
+                case "2": return StartMode.RunAll;
+                default:
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("  Invalid choice. Enter 0, 1 or 2.");
+                    Console.ResetColor();
+                    break;
+            }
+        }
+    }
+
+    // ─── Log-source Picker ────────────────────────────────────────────────────
+
+    private enum LogSource { Exit, LocalFiles, Jenkins }
+
+    private static LogSource PickLogSource()
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("Where do the S and R runs come from?");
+        Console.ResetColor();
+        Console.WriteLine("  [1]  Local log files (ATFRun folder)");
+        Console.WriteLine("  [2]  Jenkins (qsp-ci.topicusfinance.nl — pick a run, log is downloaded)");
+        Console.WriteLine("  [0]  Exit");
+        Console.WriteLine();
+
+        while (true)
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.Write("Enter choice: ");
+            Console.ResetColor();
+            var input = Console.ReadLine()?.Trim();
+            switch (input)
+            {
+                case "0": return LogSource.Exit;
+                case "1": return LogSource.LocalFiles;
+                case "2": return LogSource.Jenkins;
+                default:
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("  Invalid choice. Enter 0, 1 or 2.");
+                    Console.ResetColor();
+                    break;
+            }
+        }
+    }
+
+    // ─── Jenkins Run Picker ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Lets the user pick the S and (optionally) R runs directly from Jenkins,
+    /// downloads their timestamped console logs into the ATFRun folder, and
+    /// returns the local paths. Returns (null, null) when the user exits.
+    /// </summary>
+    private static async Task<(string? SLogPath, string? RLogPath)> PickJenkinsRunsAsync(Settings settings)
+    {
+        var source = settings.JenkinsLogSource;
+        await using var client = new JenkinsWebClient(source.StateJobUrl);
+
+        Console.WriteLine();
+        await client.EnsureLoggedInAsync(source.StateJobUrl);
+
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("Step 1/2 — Select the STATE (S) run from Jenkins:");
+        Console.ResetColor();
+        var sBuild = await PickJenkinsBuildAsync(client, source.StateJobUrl, source.BuildsToShow, allowSkip: false);
+        if (sBuild is null) return (null, null);
+
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("Step 2/2 — Select the REGRESSION (R) run from Jenkins (or 0 to skip):");
+        Console.ResetColor();
+        var rBuild = await PickJenkinsBuildAsync(client, source.RegressionJobUrl, source.BuildsToShow, allowSkip: true);
+
+        var atfRunFolder = FindAtfRunFolders(settings).First();
+        Directory.CreateDirectory(atfRunFolder);
+
+        var sLogPath = await DownloadJenkinsLogAsync(client, source.StateJobUrl, sBuild, "S", atfRunFolder);
+
+        string? rLogPath = null;
+        if (rBuild is not null)
+            rLogPath = await DownloadJenkinsLogAsync(client, source.RegressionJobUrl, rBuild, "R", atfRunFolder);
+
+        return (sLogPath, rLogPath);
+    }
+
+    private static async Task<string> DownloadJenkinsLogAsync(
+        JenkinsWebClient client,
+        string jobUrl,
+        JenkinsBuildInfo build,
+        string prefix,
+        string atfRunFolder)
+    {
+        var path = Path.Combine(atfRunFolder, $"{prefix}{build.Number}.txt");
+        Console.WriteLine($"  Downloading {prefix} run #{build.Number} console log...");
+        var log = await client.DownloadTimestampedLogAsync(jobUrl, build.Number);
+        File.WriteAllText(path, log);
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"  ✓ Saved to {path} ({log.Length / 1024} KB)");
+        Console.ResetColor();
+        return path;
+    }
+
+    private static async Task<JenkinsBuildInfo?> PickJenkinsBuildAsync(
+        JenkinsWebClient client,
+        string jobUrl,
+        int buildsToShow,
+        bool allowSkip)
+    {
+        Console.WriteLine("  Fetching runs from Jenkins...");
+        var builds = await client.GetRecentBuildsAsync(jobUrl, buildsToShow);
+
+        if (builds.Count == 0)
+        {
+            Console.WriteLine("  No builds found for this job.");
+            return null;
+        }
+
+        Console.WriteLine();
+        for (int i = 0; i < builds.Count; i++)
+        {
+            var b = builds[i];
+            Console.Write($"  [{i + 1,3}]  #{b.Number,-6} {b.StartedAt:dd-MM-yyyy HH:mm}  ");
+
+            var (label, color) = b switch
+            {
+                { Building: true } => ("RUNNING ", ConsoleColor.Cyan),
+                { Result: "SUCCESS" } => ("SUCCESS ", ConsoleColor.Green),
+                { Result: "UNSTABLE" } => ("UNSTABLE", ConsoleColor.Yellow),
+                { Result: "ABORTED" } => ("ABORTED ", ConsoleColor.DarkGray),
+                { Result: not null } => (b.Result!.PadRight(8), ConsoleColor.Red),
+                _ => ("?       ", ConsoleColor.DarkGray),
+            };
+            Console.ForegroundColor = color;
+            Console.Write(label);
+            Console.ResetColor();
+
+            Console.WriteLine($"  {b.StartedBy}");
+        }
+
+        var skipLabel = allowSkip ? "None / Skip" : "Exit";
+        Console.WriteLine($"\n  [  0]  {skipLabel}");
+        Console.WriteLine();
+
+        while (true)
+        {
+            Console.Write("Enter number: ");
+            var input = Console.ReadLine()?.Trim();
+            if (input == "0" || string.IsNullOrEmpty(input)) return null;
+
+            if (int.TryParse(input, out int choice) && choice >= 1 && choice <= builds.Count)
+            {
+                var chosen = builds[choice - 1];
+                if (chosen.Building)
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.Write($"  Run #{chosen.Number} is still running — its log will be incomplete. Use it anyway? [y/N]: ");
+                    Console.ResetColor();
+                    var confirm = Console.ReadLine()?.Trim().ToLowerInvariant();
+                    if (confirm is not ("y" or "yes")) continue;
+                }
+                Console.WriteLine();
+                return chosen;
+            }
+
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"  Invalid choice. Enter a number between 0 and {builds.Count}.");
+            Console.ResetColor();
+        }
+    }
+
+    // ─── Run All ──────────────────────────────────────────────────────────────
+
+    private static async Task<int> RunAllTestsAsync(Settings settings)
+    {
+        const string runName = "RunAll";
+        settings.ResultsOutputDirectory = Path.Combine(settings.ResultsOutputDirectory, runName);
+
+        var atfRunFolders = FindAtfRunFolders(settings);
+        var atfRunFolder = atfRunFolders.FirstOrDefault() ?? Directory.GetCurrentDirectory();
+        var knownBroken = KnownBrokenList.Load(atfRunFolder);
+
+        if (knownBroken.Count > 0)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"\nKnown-to-be-broken (will be skipped):");
+            foreach (var id in knownBroken.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                Console.WriteLine($"  - {id}");
+            Console.ResetColor();
+        }
+
+        // Prerequisites needed for test discovery
+        if (!File.Exists(settings.NUnitConsolePath))
+        {
+            Console.Error.WriteLine($"Error: nunit3-console.exe not found at: {settings.NUnitConsolePath}");
+            Console.Error.WriteLine("Check GitRepoPath / NUnitConsoleRelativePath in appsettings.json.");
+            return 1;
+        }
+        if (!File.Exists(settings.TestDllPath))
+        {
+            Console.Error.WriteLine($"Error: Test DLL not found at: {settings.TestDllPath}");
+            Console.Error.WriteLine("Build the ATF solution first, or check GitRepoPath in appsettings.json.");
+            return 1;
+        }
+
+        var previousState = LoadPreviousState(settings.ResultsOutputDirectory);
+        List<ATFRerunTool.Models.TestJob> jobs;
+
+        if (previousState is not null && previousState.StillFailingTestIds.Count > 0)
+        {
+            var relevantFailing = previousState.StillFailingTestIds
+                .Where(id => !knownBroken.Contains(id))
+                .ToList();
+
+            if (relevantFailing.Count == 0)
+            {
+                Console.WriteLine("\nAll previously-failing jobs are in the known-to-be-broken list. Nothing to rerun.");
+                jobs = [];
+            }
+            else
+            {
+                var skippedCount = previousState.StillFailingTestIds.Count - relevantFailing.Count;
+                Console.WriteLine($"\nPrevious run-all found ({previousState.CompletedAt:dd-MM-yyyy HH:mm}).");
+                Console.WriteLine($"{relevantFailing.Count} job(s) were still failing{(skippedCount > 0 ? $" ({skippedCount} known-broken excluded)" : "")}:");
+                foreach (var id in relevantFailing)
+                    Console.WriteLine($"  - {id}");
+
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write("\nContinue from previous results? [Y/n]: ");
+                Console.ResetColor();
+                var answer = Console.ReadLine()?.Trim().ToLowerInvariant();
+                bool usePrevious = answer is "" or "y" or "yes";
+
+                if (usePrevious)
+                {
+                    var allJobs = await DiscoverAllJobsAsync(settings, knownBroken);
+                    var failingIds = new HashSet<string>(relevantFailing, StringComparer.OrdinalIgnoreCase);
+                    jobs = allJobs.Where(j => failingIds.Contains(j.TestId)).ToList();
+
+                    // If a previously-failing id is no longer in the DLL (edge case), add a minimal entry
+                    foreach (var id in relevantFailing)
+                    {
+                        if (!jobs.Any(j => string.Equals(j.TestId, id, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            jobs.Add(new ATFRerunTool.Models.TestJob
+                            {
+                                TestId = id,
+                                CategoryS = "S" + id,
+                                CategoryR = "R" + id,
+                                Source = "previous session",
+                            });
+                        }
+                    }
+                    jobs.Sort((a, b) => string.Compare(a.TestId, b.TestId, StringComparison.OrdinalIgnoreCase));
+                }
+                else
+                {
+                    jobs = await DiscoverAllJobsAsync(settings, knownBroken);
+                }
+            }
+        }
+        else
+        {
+            jobs = await DiscoverAllJobsAsync(settings, knownBroken);
+        }
+
+        // The setup job is normally part of the discovered list and runs alone
+        // first in the orchestrator — only ask about a DB reset when it is not.
+        bool setupInJobs = ContainsSetupJob(settings, jobs);
+        if (setupInJobs)
+            Console.WriteLine($"\n{settings.DatabaseReset.SetupCategory} is in the job list — it will run alone first; the rest waits for it.");
+        bool dbWasReset = !setupInJobs && AskDatabaseReset(settings);
+
+        if (jobs.Count == 0)
+        {
+            Console.WriteLine("No jobs to run. All clear!");
+            return 0;
+        }
+
+        Console.WriteLine($"\nJobs to run ({jobs.Count}):");
+        foreach (var job in jobs)
+            Console.WriteLine($"  S: {job.CategoryS,-40}  R: {(job.HasRTest ? job.CategoryR : "(none)")}");
+
+        Console.WriteLine($"\nResults folder: {settings.ResultsOutputDirectory}");
+
+        AskBranch(settings);
+        ApplyEnvironmentConfig(settings);
+        AskHeadless(settings);
+        settings.MaxRerunCount = AskRetries(settings.MaxRerunCount);
+        settings.MaxParallelism = AskParallelism(settings.MaxParallelism);
+
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            Console.WriteLine("\nCancellation requested – finishing current test and saving report...");
+            cts.Cancel();
+        };
+
+        if (dbWasReset && !settings.Jenkins.Enabled)
+            await RunDatabaseSetupAsync(settings, cts.Token);
+
+        var orchestrator = new RerunOrchestrator(settings);
+        var session = await orchestrator.RunAsync(runName, jobs, cts.Token);
+
+        SavePreviousState(settings.ResultsOutputDirectory, session);
+
+        var reportPath = HtmlReportGenerator.Save(session, settings.ResultsOutputDirectory);
+        Console.WriteLine($"\nReport saved to: {reportPath}");
+
+        try { Process.Start(new ProcessStartInfo(reportPath) { UseShellExecute = true }); }
+        catch { /* non-critical */ }
+
+        bool hasFailures = session.Jobs.Any(j => session.GetVerdict(j) == ATFRerunTool.Models.JobVerdict.Fail);
+        return hasFailures ? 2 : 0;
+    }
+
+    private static async Task<List<ATFRerunTool.Models.TestJob>> DiscoverAllJobsAsync(
+        Settings settings,
+        HashSet<string> knownBroken)
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("\nDiscovering all tests from DLL...");
+        Console.ResetColor();
+
+        var tempFile = Path.ChangeExtension(Path.GetTempFileName(), ".xml");
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = settings.NUnitConsolePath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add(settings.TestDllPath);
+            psi.ArgumentList.Add($"--explore={tempFile}");
+
+            using var process = new Process { StartInfo = psi };
+            process.Start();
+            await process.WaitForExitAsync();
+
+            if (!File.Exists(tempFile) || new FileInfo(tempFile).Length == 0)
+            {
+                Console.Error.WriteLine("Warning: test discovery produced no output.");
+                return [];
+            }
+
+            var jobs = ParseExploreXml(tempFile, knownBroken);
+            Console.WriteLine($"  Found {jobs.Count} test(s) ({jobs.Count(j => j.HasRTest)} with R counterpart).");
+            return jobs;
+        }
+        finally
+        {
+            try { File.Delete(tempFile); } catch { /* non-critical */ }
+        }
+    }
+
+    private static List<ATFRerunTool.Models.TestJob> ParseExploreXml(
+        string xmlPath,
+        HashSet<string> knownBroken)
+    {
+        var allCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var doc = XDocument.Load(xmlPath);
+
+        foreach (var prop in doc.Descendants("property"))
+        {
+            if (!string.Equals((string?)prop.Attribute("name"), "Category",
+                    StringComparison.OrdinalIgnoreCase)) continue;
+            var value = (string?)prop.Attribute("value");
+            if (!string.IsNullOrEmpty(value))
+                allCategories.Add(value);
+        }
+
+        var sCategories = allCategories.Where(IsStateCategory).ToList();
+        var rCategories = allCategories.Where(IsRegressionCategory)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var jobs = new List<ATFRerunTool.Models.TestJob>();
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var sCat in sCategories)
+        {
+            var testId = LocalStripVariantPrefix(sCat);
+            if (!seenIds.Add(testId)) continue;
+            if (knownBroken.Contains(testId))
+            {
+                Console.WriteLine($"  Skipping {testId} (known to be broken).");
+                continue;
+            }
+
+            bool useUnderscore = sCat.StartsWith("S_", StringComparison.OrdinalIgnoreCase);
+            var rCat = useUnderscore ? "R_" + testId : "R" + testId;
+
+            jobs.Add(new ATFRerunTool.Models.TestJob
+            {
+                TestId = testId,
+                CategoryS = sCat,
+                CategoryR = rCat,
+                HasRTest = rCategories.Contains(rCat),
+                Source = "run all (discovered)",
+            });
+        }
+
+        jobs.Sort((a, b) => string.Compare(a.TestId, b.TestId, StringComparison.OrdinalIgnoreCase));
+        return jobs;
+    }
+
+    private static bool IsStateCategory(string category) =>
+        (category.Length > 1 && char.ToUpperInvariant(category[0]) == 'S' && category[1] != '_')
+        || category.StartsWith("S_", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsRegressionCategory(string category) =>
+        (category.Length > 1 && char.ToUpperInvariant(category[0]) == 'R' && category[1] != '_')
+        || category.StartsWith("R_", StringComparison.OrdinalIgnoreCase);
+
+    private static string LocalStripVariantPrefix(string category)
+    {
+        if (category.Length > 1 &&
+            (char.ToUpperInvariant(category[0]) == 'S' || char.ToUpperInvariant(category[0]) == 'R') &&
+            category[1] != '_')
+            return category[1..];
+        if (category.StartsWith("S_", StringComparison.OrdinalIgnoreCase) ||
+            category.StartsWith("R_", StringComparison.OrdinalIgnoreCase))
+            return category[2..];
+        return category;
     }
 }

@@ -19,4 +19,8 @@
       <TargetPath>ATFRun\KnownToBeBroken.txt</TargetPath>
     </Content>
   </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Playwright" Version="1.61.0" />
+  </ItemGroup>
 </Project>
