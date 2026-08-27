@@ -1,5 +1,6 @@
 using ATFRerunTool.Configuration;
 using ATFRerunTool.Models;
+using ATFRerunTool.Orchestration;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
@@ -39,7 +40,7 @@ public sealed class LocalTestRunner
 
         attempt.ResultXmlPath = resultFile;
 
-        Console.WriteLine($"  [{job.TestId}] Running {category} (round {round})...");
+        ConsoleProgress.WriteLine($"  [{job.TestId}] Running {category} (round {round})...");
 
         // Patch the test DLL config to speed up status-change waits, then restore after
         string? configBackup = null;
@@ -62,7 +63,7 @@ public sealed class LocalTestRunner
             else
             {
                 attempt.Status = exitCode == 0 ? RunStatus.Passed : RunStatus.Error;
-                Console.WriteLine($"  [{job.TestId}] WARNING: Result XML not found at {resultFile}");
+                ConsoleProgress.WriteLine($"  [{job.TestId}] WARNING: Result XML not found at {resultFile}");
             }
         }
         catch (OperationCanceledException)
@@ -92,8 +93,7 @@ public sealed class LocalTestRunner
         }
 
         var icon = attempt.Passed ? "✓" : "✗";
-        lock (Console.Out)
-            Console.WriteLine($"  [{job.TestId}] {icon} {category} → {attempt.Status} ({attempt.Duration:mm\\:ss})");
+        ConsoleProgress.WriteLine($"  [{job.TestId}] {icon} {category} → {attempt.Status} ({attempt.Duration:mm\\:ss})");
         return attempt;
     }
 
@@ -122,16 +122,14 @@ public sealed class LocalTestRunner
                 if (patched != original)
                 {
                     File.WriteAllText(configPath, patched);
-                    lock (Console.Out)
-                        Console.WriteLine($"  [config] MaxWaitTimeStatusChangeMiliseconds → {newValueMs}ms");
+                    ConsoleProgress.WriteLine($"  [config] MaxWaitTimeStatusChangeMiliseconds → {newValueMs}ms");
                 }
                 return (configPath, original);
             }
         }
         catch (Exception ex)
         {
-            lock (Console.Out)
-                Console.WriteLine($"  [config] Warning: could not patch DLL config: {ex.Message}");
+            ConsoleProgress.WriteLine($"  [config] Warning: could not patch DLL config: {ex.Message}");
             return (null, null);
         }
     }
@@ -146,8 +144,7 @@ public sealed class LocalTestRunner
         }
         catch (Exception ex)
         {
-            lock (Console.Out)
-                Console.WriteLine($"  [config] Warning: could not restore DLL config: {ex.Message}");
+            ConsoleProgress.WriteLine($"  [config] Warning: could not restore DLL config: {ex.Message}");
         }
     }
 
@@ -180,12 +177,12 @@ public sealed class LocalTestRunner
         process.OutputDataReceived += (_, e) =>
         {
             if (e.Data != null)
-                lock (Console.Out) Console.WriteLine(prefix + e.Data);
+                ConsoleProgress.WriteLine(prefix + e.Data);
         };
         process.ErrorDataReceived += (_, e) =>
         {
             if (e.Data != null)
-                lock (Console.Out) Console.WriteLine(prefix + "ERR: " + e.Data);
+                ConsoleProgress.WriteLine(prefix + "ERR: " + e.Data);
         };
 
         process.Start();

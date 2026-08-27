@@ -13,46 +13,153 @@ namespace ATFRerunTool;
 
 internal static class Program
 {
+    private static int _crashHandled;
+
     private static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
+        InstallCrashHandlers();
         PrintBanner();
 
+        int exitCode;
         try
         {
-            // Load settings
-            var settings = LoadSettings();
-
-            if (args.Length == 0 || args[0] is "-h" or "--help")
-            {
-                if (args.Length == 0)
-                {
-                    // No args at all — try the file picker first
-                    return await RunRerunCommand(args, settings);
-                }
-                PrintHelp(settings);
-                return 0;
-            }
-
-            // Determine mode
-            var command = args[0].ToLowerInvariant();
-
-            return command switch
-            {
-                "rerun" => await RunRerunCommand(args, settings),
-                "report" => RunReportCommand(args, settings),
-                _ => await RunRerunCommand(args, settings), // default: treat first arg as log path
-            };
+            exitCode = await RunAsync(args);
         }
         catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.Error.WriteLine($"\nUnhandled error: {ex.Message}");
-            Console.Error.WriteLine(ex.StackTrace);
-            Console.ResetColor();
-            Console.WriteLine("\nPress any key to exit...");
-            Console.ReadKey(intercept: true);
+            ReportCrash(ex, "Unhandled error");
             return 1;
+        }
+
+        if (exitCode != 0)
+            PauseBeforeExit($"Finished with errors (exit code {exitCode}).");
+
+        return exitCode;
+    }
+
+    private static async Task<int> RunAsync(string[] args)
+    {
+        // Load settings
+        var settings = LoadSettings();
+
+        if (args.Length == 0 || args[0] is "-h" or "--help")
+        {
+            if (args.Length == 0)
+            {
+                // No args at all — try the file picker first
+                return await RunRerunCommand(args, settings);
+            }
+            PrintHelp(settings);
+            return 0;
+        }
+
+        // Determine mode
+        var command = args[0].ToLowerInvariant();
+
+        return command switch
+        {
+            "rerun" => await RunRerunCommand(args, settings),
+            "report" => RunReportCommand(args, settings),
+            _ => await RunRerunCommand(args, settings), // default: treat first arg as log path
+        };
+    }
+
+    // ─── Crash handling ───────────────────────────────────────────────────────
+
+    /// <summary>Catches failures that never reach Main's try/catch — exceptions thrown on
+    /// worker threads (e.g. a Process output handler) or in tasks nobody awaited. Without
+    /// these the runtime kills the process silently and the terminal window disappears.</summary>
+    private static void InstallCrashHandlers()
+    {
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            ReportCrash(e.ExceptionObject as Exception, "Fatal error on a background thread");
+
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            e.SetObserved();
+            ReportCrash(e.Exception, "Unobserved background task error");
+        };
+    }
+
+    /// <summary>Prints the failure in full, writes a crash log next to the exe and waits for a
+    /// keypress so the error stays readable when the tool is started by double-clicking.</summary>
+    private static void ReportCrash(Exception? ex, string headline)
+    {
+        // A background handler and Main's catch can both land here for the same failure.
+        if (Interlocked.Exchange(ref _crashHandled, 1) == 1) return;
+
+        ConsoleProgress.Stop(); // erase the progress footer so it can't overwrite the message
+
+        var details = ex?.ToString() ?? "(no exception details available)";
+
+        try
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("──────────────────────────────────────────────────────────────");
+            Console.Error.WriteLine($"  {headline}: {ex?.Message ?? "unknown error"}");
+            Console.Error.WriteLine("──────────────────────────────────────────────────────────────");
+            Console.ResetColor();
+            Console.Error.WriteLine(details);
+        }
+        catch { /* console may be gone — the log file below is the fallback */ }
+
+        var logPath = TryWriteCrashLog(headline, details);
+        if (logPath is not null)
+        {
+            try
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Error.WriteLine($"\nCrash log written to: {logPath}");
+                Console.ResetColor();
+            }
+            catch { /* ignore */ }
+        }
+
+        PauseBeforeExit("The tool stopped because of the error above.");
+    }
+
+    private static string? TryWriteCrashLog(string headline, string details)
+    {
+        try
+        {
+            var dir = Path.Combine(AppContext.BaseDirectory, "CrashLogs");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, $"crash-{DateTime.Now:yyyyMMdd-HHmmss}-{Environment.ProcessId}.log");
+            File.WriteAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {headline}{Environment.NewLine}{Environment.NewLine}{details}{Environment.NewLine}");
+            return path;
+        }
+        catch
+        {
+            return null; // never let logging failures mask the original error
+        }
+    }
+
+    /// <summary>Keeps the window open until the user acknowledges. Drains keys typed during the
+    /// run first, otherwise a stray buffered keystroke dismisses the message instantly.</summary>
+    private static void PauseBeforeExit(string message)
+    {
+        try
+        {
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine(message);
+            Console.WriteLine("Press any key to exit...");
+            Console.ResetColor();
+
+            if (Console.IsInputRedirected)
+            {
+                Console.In.ReadLine();
+                return;
+            }
+
+            while (Console.KeyAvailable) Console.ReadKey(intercept: true);
+            Console.ReadKey(intercept: true);
+        }
+        catch
+        {
+            // No interactive console attached — nothing to wait for.
         }
     }
 
@@ -273,6 +380,9 @@ internal static class Program
 
         // Ask about retries (default: No — run once without extra rounds)
         settings.MaxRerunCount = AskRetries(settings.MaxRerunCount);
+
+        // Ask whether round 1 should skip S and go straight to R
+        settings.SkipStateOnFirstRound = AskSkipStateFirstRound(jobs);
 
         // Ask for parallelism
         settings.MaxParallelism = AskParallelism(settings.MaxParallelism);
@@ -964,6 +1074,31 @@ internal static class Program
         return 1;
     }
 
+    /// <summary>
+    /// Asks whether round 1 should skip the S (state) test for jobs that have an R
+    /// counterpart and go straight to R — useful when the state is already known to be
+    /// valid and rerunning it would just waste time. S still runs normally from round 2
+    /// onward for anything that keeps failing, and jobs without an R test always run S.
+    /// </summary>
+    private static bool AskSkipStateFirstRound(List<ATFRerunTool.Models.TestJob> jobs)
+    {
+        if (!jobs.Any(j => j.HasRTest))
+            return false;
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.Write("Skip S (state) tests on round 1 and go straight to R? [y/N]: ");
+        Console.ResetColor();
+
+        var input = Console.ReadLine()?.Trim().ToLowerInvariant();
+        bool skip = input is "y" or "yes";
+
+        Console.WriteLine(skip
+            ? "  → Round 1 will run R only (for jobs with an R test); S resumes from round 2 if needed."
+            : "  → S will run every round as usual.");
+
+        return skip;
+    }
+
     private static ATFRerunTool.Models.PreviousRunState? LoadPreviousState(string resultsDir)
     {
         var path = Path.Combine(resultsDir, "previous_state.json");
@@ -1483,6 +1618,7 @@ Rerun logic:
         ApplyEnvironmentConfig(settings);
         AskHeadless(settings);
         settings.MaxRerunCount = AskRetries(settings.MaxRerunCount);
+        settings.SkipStateOnFirstRound = AskSkipStateFirstRound(jobs);
         settings.MaxParallelism = AskParallelism(settings.MaxParallelism);
 
         using var cts = new CancellationTokenSource();

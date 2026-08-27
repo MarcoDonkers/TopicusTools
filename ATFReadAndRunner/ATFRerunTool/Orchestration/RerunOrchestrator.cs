@@ -48,16 +48,21 @@ public sealed class RerunOrchestrator
 
         int parallelism = _settings.MaxParallelism > 0 ? _settings.MaxParallelism : Environment.ProcessorCount;
 
-        Console.WriteLine(new string('=', 80));
-        Console.WriteLine($"Starting rerun session: {session.SessionId}");
-        Console.WriteLine($"Jobs to rerun:  {jobs.Count}");
-        Console.WriteLine($"Max rounds:     {_settings.MaxRerunCount}");
-        Console.WriteLine($"Parallelism:    {parallelism}");
-        Console.WriteLine($"Runner:         {(_settings.Jenkins.Enabled ? "Jenkins" : "Local NUnit")}");
-        Console.WriteLine(new string('=', 80) + "\n");
+        ConsoleProgress.Start(jobs.Count);
+
+        ConsoleProgress.WriteLine(new string('=', 80));
+        ConsoleProgress.WriteLine($"Starting rerun session: {session.SessionId}");
+        ConsoleProgress.WriteLine($"Jobs to rerun:  {jobs.Count}");
+        ConsoleProgress.WriteLine($"Max rounds:     {_settings.MaxRerunCount}");
+        ConsoleProgress.WriteLine($"Parallelism:    {parallelism}");
+        ConsoleProgress.WriteLine($"Runner:         {(_settings.Jenkins.Enabled ? "Jenkins" : "Local NUnit")}");
+        if (_settings.SkipStateOnFirstRound)
+            ConsoleProgress.WriteLine("Round 1:        S skipped for jobs with an R counterpart (assumes state is valid)", ConsoleColor.Yellow);
+        ConsoleProgress.WriteLine(new string('=', 80) + "\n");
 
         // Only track R permanently — once R goes green the job is done.
-        // S always runs fresh each round because it rebuilds state that R depends on.
+        // S always runs fresh each round because it rebuilds state that R depends on
+        // (unless SkipStateOnFirstRound short-circuits round 1 for jobs that have an R test).
         var rPassed = new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
         // Thread-safe collection for accumulating attempts across parallel workers
@@ -69,7 +74,11 @@ public sealed class RerunOrchestrator
         {
             if (queue.Count == 0) break;
 
-            Console.WriteLine($"\n--- Round {round} / {_settings.MaxRerunCount} ({queue.Count} job(s), parallelism={parallelism}) ---\n");
+            // Jobs still in the queue are being re-attempted this round — their previous
+            // "failed" count no longer applies until this round's outcome is known.
+            ConsoleProgress.ResetRoundFailures();
+
+            ConsoleProgress.WriteLine($"\n--- Round {round} / {_settings.MaxRerunCount} ({queue.Count} job(s), parallelism={parallelism}) ---\n");
 
             var parallelOptions = new ParallelOptions
             {
@@ -87,7 +96,7 @@ public sealed class RerunOrchestrator
             if (setupJob is not null)
             {
                 if (queue.Count > 1)
-                    WriteColored($"  {setupJob.CategoryS} runs alone first — {queue.Count - 1} other job(s) wait for it.\n", ConsoleColor.Yellow);
+                    ConsoleProgress.WriteLine($"  {setupJob.CategoryS} runs alone first — {queue.Count - 1} other job(s) wait for it.\n", ConsoleColor.Yellow);
                 await RunJobAsync(setupJob, round, rPassed, allAttempts, cancellationToken);
                 parallelQueue = queue.Where(j => !ReferenceEquals(j, setupJob)).ToList();
             }
@@ -102,11 +111,12 @@ public sealed class RerunOrchestrator
             queue.RemoveAll(j => rPassed.ContainsKey(j.TestId));
 
             int nowGreen = jobs.Count - queue.Count;
-            Console.WriteLine($"\nRound {round} complete.  Green: {nowGreen}/{jobs.Count}.  Still failing: {queue.Count}.");
+            ConsoleProgress.WriteLine($"\nRound {round} complete.  Green: {nowGreen}/{jobs.Count}.  Still failing: {queue.Count}.");
         }
 
         session.FinishedAt = DateTime.Now;
-        Console.WriteLine($"\nAll rounds complete. Total duration: {session.FinishedAt - session.StartedAt:hh\\:mm\\:ss}");
+        ConsoleProgress.WriteLine($"\nAll rounds complete. Total duration: {session.FinishedAt - session.StartedAt:hh\\:mm\\:ss}");
+        ConsoleProgress.Stop();
         return session;
     }
 
@@ -121,28 +131,55 @@ public sealed class RerunOrchestrator
         if (alreadyGreen)
         {
             // Should not be in queue, but guard anyway
-            WriteColored($"  [{job.TestId}] Skipping — already fully green.", ConsoleColor.DarkGray);
+            ConsoleProgress.WriteLine($"  [{job.TestId}] Skipping — already fully green.", ConsoleColor.DarkGray);
             return;
         }
 
-        // ── State test — always runs each round ────────────────────
-        var sAttempt = await ExecuteAsync(job, TestVariant.State, round, ct);
-        allAttempts.Add(sAttempt);
+        // ── State test — always runs each round, unless SkipStateOnFirstRound
+        // short-circuits round 1 for a job that has an R counterpart to fall back on ──
+        bool skipState = _settings.SkipStateOnFirstRound && round == 1 && job.HasRTest;
 
-        // ── Regression test — only if S passed this round ──────────
-        if (sAttempt.Passed && job.HasRTest)
+        TestRunAttempt? sAttempt = null;
+        if (skipState)
+        {
+            ConsoleProgress.WriteLine($"  [{job.TestId}] Skipping {job.CategoryS} (round 1) — assuming state is already valid.", ConsoleColor.DarkGray);
+        }
+        else
+        {
+            sAttempt = await ExecuteAsync(job, TestVariant.State, round, ct);
+            allAttempts.Add(sAttempt);
+        }
+
+        bool sPassed = skipState || (sAttempt?.Passed ?? false);
+
+        // ── Regression test — only if S passed (or was skipped) this round ──
+        if (sPassed && job.HasRTest)
         {
             var rAttempt = await ExecuteAsync(job, TestVariant.Regression, round, ct);
             allAttempts.Add(rAttempt);
-            if (rAttempt.Passed) rPassed.TryAdd(job.TestId, true);
+            if (rAttempt.Passed)
+            {
+                rPassed.TryAdd(job.TestId, true);
+                ConsoleProgress.MarkPassed();
+            }
+            else
+            {
+                ConsoleProgress.MarkFailed();
+            }
         }
-        else if (!sAttempt.Passed && job.HasRTest)
+        else if (!sPassed && job.HasRTest)
         {
-            WriteColored($"  [{job.TestId}] Skipping {job.CategoryR} — S did not pass this round.", ConsoleColor.DarkGray);
+            ConsoleProgress.WriteLine($"  [{job.TestId}] Skipping {job.CategoryR} — S did not pass this round.", ConsoleColor.DarkGray);
+            ConsoleProgress.MarkFailed();
         }
-        else if (sAttempt.Passed && !job.HasRTest)
+        else if (sPassed && !job.HasRTest)
         {
             rPassed.TryAdd(job.TestId, true); // S-only job, counts as done
+            ConsoleProgress.MarkPassed();
+        }
+        else // !sPassed && !job.HasRTest — S-only job whose S attempt failed
+        {
+            ConsoleProgress.MarkFailed();
         }
     }
 
@@ -156,15 +193,5 @@ public sealed class RerunOrchestrator
             return await _jenkinsRunner.RunAsync(job, variant, round, ct);
 
         return await _localRunner.RunAsync(job, variant, round, ct);
-    }
-
-    private static void WriteColored(string message, ConsoleColor color)
-    {
-        lock (Console.Out)
-        {
-            Console.ForegroundColor = color;
-            Console.WriteLine(message);
-            Console.ResetColor();
-        }
     }
 }

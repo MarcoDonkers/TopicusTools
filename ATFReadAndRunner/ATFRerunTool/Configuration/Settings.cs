@@ -26,6 +26,13 @@ public sealed class Settings
     public int MaxParallelism { get; set; } = 5;
 
     /// <summary>
+    /// When true, round 1 skips the S (state) test for jobs that have an R counterpart and
+    /// goes straight to R, assuming the state is already valid. S still runs normally from
+    /// round 2 onward for anything that keeps failing. Jobs without an R test always run S.
+    /// </summary>
+    public bool SkipStateOnFirstRound { get; set; } = false;
+
+    /// <summary>
     /// If > 0, overrides MaxWaitTimeStatusChangeMiliseconds in the test DLL config before each run.
     /// Use to make status-change waits fail faster locally. 0 = don't override.
     /// </summary>

@@ -1,5 +1,6 @@
 using ATFRerunTool.Configuration;
 using ATFRerunTool.Models;
+using ATFRerunTool.Orchestration;
 
 namespace ATFRerunTool.Running;
 
@@ -54,7 +55,7 @@ public sealed class JenkinsTestRunner
 
         try
         {
-            Console.WriteLine($"  Triggering Jenkins: {jenkinsJobName}");
+            ConsoleProgress.WriteLine($"  Triggering Jenkins: {jenkinsJobName}");
 
             // Trigger build
             var triggerResponse = await _http.PostAsync(triggerUrl, null, cancellationToken);
